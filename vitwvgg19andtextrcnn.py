@@ -30,20 +30,6 @@ def patchify(images, n_patches):
     return patches
 
 
-class TextRCNN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(TextRCNN, self).__init__()
-        self.hidden_dim = hidden_dim
-        self.embedding = nn.Embedding(input_dim, hidden_dim)
-        self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        embedded = self.embedding(x)
-        lstm_out, _ = self.lstm(embedded)
-        out = self.fc(lstm_out[:, -1, :])
-        return out
-
 
 class MyMSA(nn.Module):
     def __init__(self, d, n_heads=2):
