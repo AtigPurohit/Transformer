@@ -160,6 +160,12 @@ class VisionTransformer(nn.Module):
         )
 
         self._init_weights()
+        self._make_trainable()
+
+    def _make_trainable(self):
+        # Set requires_grad=True for all model parameters
+        for param in self.parameters():
+            param.requires_grad = True
 
 
     def _init_weights(self):
@@ -511,9 +517,9 @@ def training():
     # torch.save({
     #     'model_state_dict': model.state_dict(),
     #     'ontology_graph': ontology_graph
-    # }, "model_with_ontology_graph.pt")
+    # }, "model_with_ontology_graph.pt")okk
 
     # Save the trained model
-    torch.save(model.state_dict(), "final_model.pth")
+    torch.save(model.state_dict(), "text_model.pth")
 
 training()

@@ -19,30 +19,6 @@ from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 from torchvision.models import vgg19
 import torchvision.models as models
-import torch.nn.utils.rnn as rnn_utils
-
-
-class TextRCNN(nn.Module):
-    def __init__(self, input_size, hidden_size, num_classes):
-        super(TextRCNN, self).__init__()
-        self.hidden_size = hidden_size
-        self.lstm = nn.LSTM(
-            input_size, hidden_size, batch_first=True, bidirectional=True
-        )
-        self.fc = nn.Linear(hidden_size * 2, num_classes)
-
-    def forward(self, x):
-        # Add a sequence dimension of size 1 to the input
-        x = x.unsqueeze(1)
-        lstm_out, _ = self.lstm(x)
-        # Concatenate the last time step's output from both directions
-        x = torch.cat(
-            (lstm_out[:, -1, : self.hidden_size], lstm_out[:, 0, self.hidden_size :]),
-            dim=1,
-        )
-        output = self.fc(x)
-        return output
-
 
 class PatchEmbedding(nn.Module):
     def __init__(self, image_size, patch_size, in_channels, embed_dim):
@@ -64,23 +40,9 @@ class PatchEmbedding(nn.Module):
         x = self.projection(x).flatten(2).transpose(1, 2)  # B, P*P, E
         return x
 
-
-class MLP(nn.Module):
-    def __init__(self, in_features, hidden_features, out_features):
-        super(MLP, self).__init__()
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        x = self.act(self.fc1(x))
-        x = self.fc2(x)
-        return x
-
-
 class DeformableMLPHead(nn.Module):
     def __init__(
-        self, in_features, hidden_features, num_classes, text_rcnn_hidden_size
+        self, in_features, hidden_features, num_classes
     ):
         super(DeformableMLPHead, self).__init__()
         self.deformable_conv1 = DeformConv2d(
@@ -90,20 +52,13 @@ class DeformableMLPHead(nn.Module):
             hidden_features, hidden_features, kernel_size=3, padding=1
         )
         self.fc = nn.Linear(hidden_features, num_classes)
-        self.text_rcnn = TextRCNN(hidden_features, text_rcnn_hidden_size, num_classes)
 
     def forward(self, x, offset):
         x = F.relu(self.deformable_conv1(x, offset))
         x = F.relu(self.deformable_conv2(x, offset))
         x = F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
-
-        # MLP head for bounding box prediction
-        bb_predictions = self.fc(x)
-
-        # TextRCNN head for text recognition
-        text_predictions = self.text_rcnn(x)
-
-        return bb_predictions, text_predictions
+        output = self.fc(x)
+        return output
 
 
 class VisionTransformer(nn.Module):
@@ -117,8 +72,6 @@ class VisionTransformer(nn.Module):
         depth,
         num_heads,
         mlp_ratio,
-        unique_classes,
-        text_rcnn_hidden_size=128,
     ):
         super(VisionTransformer, self).__init__()
         self.patch_embed = PatchEmbedding(
@@ -128,7 +81,6 @@ class VisionTransformer(nn.Module):
         self.image_size = image_size  # Define the image size attribute
         self.patch_size = patch_size
         self.embed_dim = embed_dim
-        self.unique_classes = unique_classes
 
         num_patches = (image_size[0] // patch_size) * (image_size[1] // patch_size)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -156,17 +108,10 @@ class VisionTransformer(nn.Module):
         )  # 18 for 2D offsets (2*kernel_size^2)
 
         self.deformable_mlp_head = DeformableMLPHead(
-            embed_dim, 256, num_classes, text_rcnn_hidden_size
+            embed_dim, 256, num_classes
         )
 
         self._init_weights()
-        self._make_trainable()
-
-    def _make_trainable(self):
-        # Set requires_grad=True for all model parameters
-        for param in self.parameters():
-            param.requires_grad = True
-
 
     def _init_weights(self):
         # Initialize transformer weights
@@ -227,12 +172,11 @@ class VisionTransformer(nn.Module):
         # Compute offsets for deformable convolution
         offset = self.offset_layer(x)
 
-        # Predict bounding box coordinates using deformable CNN layers
-        bb_predictions, text_predictions = self.deformable_mlp_head(x, offset)
+        # Predict bounding box coordinates using deformable
+        bb_predictions = self.deformable_mlp_head(x, offset)
 
-        return bb_predictions, text_predictions
-
-
+        return bb_predictions
+    
 class CustomDataset(Dataset):
     def __init__(self, image_folder, label_folder, transform=None):
         self.image_folder = image_folder
@@ -250,10 +194,6 @@ class CustomDataset(Dataset):
             text = label_values[-1]  # Get the last value as the class label (text)
             self.texts.append(text)
 
-         # Create a mapping from text labels to unique numeric indices
-        self.text_to_idx = {text: idx for idx, text in enumerate(set(self.texts))}
-
-
     def __len__(self):
         return len(self.image_list)
 
@@ -270,11 +210,10 @@ class CustomDataset(Dataset):
 
         # Extract bounding box coordinates and text from the label
         num_coords = len(label_values)
-        bbox_coords = [float(val) for val in label_values[:4]]  # Convert to float
-        label = int(label_values[4])  # Convert label to integer
-        text = " ".join(label_values[5:]) if num_coords > 5 else ""  # Join the rest as the text label
-        # Convert text label to its corresponding numeric index
-        text_idx = self.text_to_idx.get(text, -1)
+        bbox_coords = list(map(int, label_values[: num_coords - 2]))
+        label = int(label_values[num_coords - 2])  # Convert label to integer
+        text = label_values[num_coords - 1]
+
         # Convert bounding box to (x_min, y_min, x_max, y_max) format and normalize
         width, height = image.size
         num_points = len(bbox_coords) // 2
@@ -290,7 +229,7 @@ class CustomDataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        return image, bbox, label, text_idx
+        return image, bbox, label, text
 
 
 def create_dataset():
@@ -304,12 +243,8 @@ def create_dataset():
         ]
     )
 
-    image_folder = "CTW/train_images"
-    label_folder = "/home/spyder/Dev/Transformer/CTW/train_gt3"
-
-    #For windows 
-    # image_folder = "C:\\Users\\CVPR\\Documents\\Atig Marathon\\CWT\\train_images\\train_images"
-    # label_folder = "C:\\Users\\CVPR\\Documents\\Atig Marathon\\CWT\\ctw1500_train_labels\\ctw1500_train_labels"
+    image_folder = "Marathon/train_image/train_image"
+    label_folder = "Marathon/train_gt3"
 
     dataset = CustomDataset(
         image_folder=image_folder, label_folder=label_folder, transform=transform
@@ -328,20 +263,15 @@ def create_dataset():
     train_dataset.texts = [dataset.texts[i] for i in train_dataset.indices]
     val_dataset.texts = [dataset.texts[i] for i in val_dataset.indices]
 
-    # print("Unique Classes ", unique_classes)
-    unique_classes.append("UNK")
-
     return train_dataset, val_dataset, unique_classes
 
 
 def training():
-    #  Define training parameters
+    # Define training parameters
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device: ", device, f"({torch.cuda.get_device_name(device)})" if torch.cuda.is_available() else "")
-    # device = "cpu"
-    # print("Using device: ", device)
-    batch_size = 64
-    num_epochs = 50
+    batch_size = 128
+    num_epochs = 1
     learning_rate = 1e-3
     weight_decay = 1e-4
 
@@ -356,12 +286,6 @@ def training():
     )
 
     train_dataset, val_dataset, unique_classes = create_dataset()
-    # # Load CIFAR-10 dataset
-    # cifar_train_dataset = datasets.CIFAR10(root='./data', train=True, transform=transform, download=True)
-    # train_size = int(0.8 * len(cifar_train_dataset))
-    # val_size = len(cifar_train_dataset) - train_size
-    # train_dataset, val_dataset = random_split(cifar_train_dataset, [train_size, val_size])
-
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=2
     )
@@ -369,23 +293,15 @@ def training():
         val_dataset, batch_size=batch_size, shuffle=False, num_workers=2
     )
 
-    # Simple example of an ontology graph with 4 classes and 3 connections
-    # Each class is represented as a node, and connections are represented as edge pairs (src, dst)
-    edge_index = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
-    edge_attr = torch.tensor(
-        [1, 2, 3], dtype=torch.float
-    )  # Example edge attributes (if any)
-
-    # Initialize the model and optimizer
+    # Initialize the Vision Transformer model
     image_size = (32, 32)  # CIFAR-10 image size
     patch_size = 8  # Smaller patch size to reduce computation
     in_channels = 3
-    num_classes = 9000  # CIFAR-10 has 10 classes
+    num_classes = 4  # Assuming 4 classes for text detection
     embed_dim = 256
     depth = 12
     num_heads = 4
     mlp_ratio = 4
-    text_rcnn_hidden_size = 128
 
     model = VisionTransformer(
         image_size,
@@ -396,22 +312,20 @@ def training():
         depth,
         num_heads,
         mlp_ratio,
-        text_rcnn_hidden_size,
     ).to(device)
+
+    # Define the loss function for bounding box predictions
+    bb_criterion = nn.SmoothL1Loss()
+
+    # Define the optimizer and scheduler
     optimizer = optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
     scheduler = StepLR(optimizer, step_size=10, gamma=0.5)
 
-    # Define the loss functions for bounding box predictions and text recognition predictions
-    bb_criterion = nn.CrossEntropyLoss()
-    text_criterion = nn.CrossEntropyLoss()
-
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
-        bb_correct = 0
-        text_correct = 0
         total = 0
 
         with tqdm(
@@ -427,20 +341,8 @@ def training():
                     texts,
                 )
 
-                # Create a mapping from text to numerical indices
-                text_to_idx = {text: idx for idx, text in enumerate(unique_classes)}   
-                text_to_idx["UNK"] = len(unique_classes) - 1             
-
-                # Convert the text tensors to strings
-                texts = [str(text) for text in texts]
-
-                # Convert the text labels to their corresponding numeric indices using the text_to_idx mapping
-                text_indices = [text_to_idx.get(text, text_to_idx["UNK"]) for text in texts]
-                text_targets = torch.tensor(text_indices, dtype=torch.long, device=device)
-
-
                 optimizer.zero_grad()
-                bb_outputs, text_outputs = model(data)
+                bb_outputs = model(data)
 
                 # Flatten both bbox_coords and bb_outputs
                 batch_size, num_bboxes = bbox_coords.size()
@@ -453,86 +355,41 @@ def training():
                     -1, num_classes
                 )  # Reshape to [batch_size * num_bboxes, num_classes]
 
-                # # Compute bounding box loss
-                # bb_loss = nn.SmoothL1Loss()(bb_outputs, bbox_coords)
+                # Compute bounding box loss
+                bb_loss = bb_criterion(bb_outputs, bbox_coords)
 
-                # Compute text recognition loss (assuming you have a text_criterion for text recognition task)
-                text_loss = text_criterion(text_outputs, text_targets)
-
-                # Combined loss (you can adjust the weighting of the losses if needed)
-                # loss = bb_loss + text_loss
-                loss = text_loss
-
+                loss = bb_loss
                 loss.backward()
                 optimizer.step()
 
                 train_loss += loss.item()
-
-                # For accuracy calculation, you need to convert text_outputs to predictions (if needed)
-                # and then compare with text_targets
-                # bb_correct and text_correct can be updated accordingly
+                total += data.size(0)
 
                 # Update the progress bar
-                pbar.set_postfix(
-                    {
-                        "Loss": train_loss / (batch_idx + 1),
-                        # "BB Acc": 100. * bb_correct / total,
-                        # "Text Acc": 100. * text_correct / total
-                    }
-                )
+                pbar.set_postfix({"Loss": train_loss / (batch_idx + 1)})
                 pbar.update()
 
-        # Validation
         model.eval()
-        correct, total = 0, 0
-        with torch.no_grad(), tqdm(
-            total=len(val_loader), desc="Validation", unit="batch"
-        ) as pbar:
+        val_loss = 0.0
+        with torch.no_grad():
             for data, bbox_coords, labels, texts in val_loader:
-                data, bbox_coords, labels = (
-                    data.to(device),
-                    bbox_coords.to(device),
-                    labels.to(device),
-                )
-                bb_outputs, text_outputs = model(data)
+                data, bbox_coords = data.to(device), bbox_coords.to(device)
 
-                _, bb_predicted = torch.max(bb_outputs.data, 1)
-                _, text_predicted = torch.max(text_outputs.data, 1)
+                bb_outputs = model(data)
+                bb_loss = bb_criterion(bb_outputs, bbox_coords)
 
-                text_to_idx = {text: idx for idx, text in enumerate(unique_classes)}   
-                text_to_idx["UNK"] = len(unique_classes) - 1             
+                val_loss += bb_loss.item()
 
-                # Convert the text tensors to strings
-                texts = [str(text) for text in texts]
+        val_loss /= len(val_loader)
+        print(f"Validation Loss: {val_loss}")
 
-                # Convert the text labels to their corresponding numeric indices using the text_to_idx mapping
-                text_indices = [text_to_idx.get(text, text_to_idx["UNK"]) for text in texts]
-                text_targets = torch.tensor(text_indices, dtype=torch.long, device=device)
-
-                total += bbox_coords.size(0)
-                # bb_correct += (bb_predicted == bbox_coords).sum().item()       
-
-
-                text_correct += (text_predicted == text_targets).sum().item()
-
-                # Update the tqdm bar
-                pbar.update()
-
-        # val_bb_accuracy = 100. * bb_correct / total
-        val_text_accuracy = 100.0 * text_correct / total
-        print(
-            f"Validation BB Accuracy: , Validation Text Accuracy: {val_text_accuracy:.2f}%"
-        )
+        # Adjust learning rate
+        scheduler.step()
 
     print("Training finished!")
 
-    # # Save the trained model
-    # torch.save({
-    #     'model_state_dict': model.state_dict(),
-    #     'ontology_graph': ontology_graph
-    # }, "model_with_ontology_graph.pt")okk
-
     # Save the trained model
-    torch.save(model.state_dict(), "cwt_model.pth")
+    torch.save(model.state_dict(), "reidentification_model.pth")
 
-training()
+if __name__ == '__main__':
+    training()
